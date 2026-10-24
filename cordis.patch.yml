@@ -1,0 +1,4 @@
+# dsh-quick-restart bundle patch
+- insert:
+    - id: dsh-quick-restart
+      name: dsh-quick-restart
