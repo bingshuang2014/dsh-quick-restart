@@ -59,6 +59,11 @@ pnpm add dsh-quick-restart
 |---|---|---|---|
 | ① 前缀对不上 | `lib/index.js` `invalidateDir` | 用 `fileURLToPath(url)` 拿到的是 **profile 里的 junction 路径**，而 `loader.internal.loadCache` 的 key 是 Node 解析后的**真实路径**，前缀不匹配 → 一条都清不掉（实测 `cleared = 0`）→ `loader.import` 命中缓存返回旧模块 | 先用 `realpathSync` 解析 junction 再算前缀 |
 | ② 引擎级缓存 | `lib/index.js` `reloadOne` | 即使 `loadCache` 清干净（实测 `cleared = 31`），Node 的 **ESM 模块表**（引擎级 ModuleMap）对同一个 `file:` URL 第二次 `import` 直接返回缓存模块 | `loader.import` 的 URL 追加 `?dshReload=<ts>`，每次 URL 都不同 |
+| ③ 同一个包**只能重载一次** | `lib/index.js` `reloadOne` | 第一次重载生效，之后每次接口都返 `{"ok":true,...,"cleared":31}`，但服务端代码**永远停在第一次那份**（实测 `MARK_V1 → 写 V2 重载 → 仍 V1 → 写 V3 重载 → 仍 V1`） | 见下 | 
+
+缺陷③ 的根因在 cordis 内部（`@deepseek-ai/cordis` `src/registry.ts`）：registry 的 `_internal` 是 **`Map<callback, Runtime>`**（key 是插件回调身份），只有 `delete(plugin)` 会 `fiber.dispose()`——而**每次重载 `import` 出的都是新模块 → 新 callback**，loader entry 里那个 fiber 只对应**第一次**加载的 runtime。于是第二次重载 `delete` 的是早已删掉的旧 runtime（no-op），**上一次重载实例的 fiber 永远不会被 dispose**，它注册的原生工具 / persona section / HTTP 路由一直挂着，新实例 `apply()` 走到注册那一段就撞名抛错；而 cordis 是异步跑 `apply` 的，**异常被吞掉** → 又是一层 `ok:true` 的假成功。
+
+修法：自己记住「上一次重载注册进去的那个 plugin 对象」（`swapped: Map<包名, plugin>`），下次重载先把**它**（连同 entry 里那个）从 registry 删掉，再注册新的。
 
 另外三条是**独立验证（离线最小实验）推翻了原方案后改的**，都能复算：
 
@@ -87,13 +92,14 @@ pnpm add dsh-quick-restart
 
 ### 怎么判断真的修好了（别只看 `ok`）
 
-`ok: true` 只代表没抛异常。唯一可信的是**可观测标记对照实验**：
+`ok: true` 只代表没抛异常。唯一可信的是**可观测标记对照实验**，而且**必须连续做 3 次**——「同一个包只能重载一次」那个缺陷只在第二次以后暴露：
 
-1. 在目标插件里加一处可观测的标记（例如它的 health 路由返回值里加一行 `reloadMark: 'MARK_V1'`）；
+1. 在目标插件里加一处可观测的标记（例如它的 health 路由返回值里加一行 `reloadMark: 'M1'`）；
 2. 重载**之前**先读一次接口 → 应看不到该标记；
 3. `POST /dsh-quick-restart/reload` `{"confirm":true,"packages":["<包名>"]}`；
-4. 再读一次 → 标记**出现**了才算真的重载成功（没出现就还有第三层缓存）；同时看响应里的 `cleared`：`cleared: 0` 说明缺陷① 没修好；`cleared > 0` 但标记没变说明缺陷② 没修好；
-5. 验证完立刻删掉那个标记，并再重载一次恢复原状。
+4. 再读一次 → 标记**出现**了才算真的重载成功（没出现就还有第三层缓存）；同时看响应里的 `cleared`：`cleared: 0` 说明缺陷① 没修好；`cleared > 0` 但标记没变说明缺陷② 或 ③ 没修好；
+5. **把标记改成 `M2`（再写 `M3`），重复第 3–4 步**：每次重载后标记都必须跟着变。若第一次变了、后面不变，就是缺陷③（旧实例的 fiber 没被 dispose，新实例撞名抛错被异步吞掉）——**这时接口仍然返回 `ok:true` 与 `cleared>0`**；
+6. 验证完立刻删掉那个标记，并再重载一次恢复原状。
 
 ## 卸载
 
