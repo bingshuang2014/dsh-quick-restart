@@ -51,7 +51,19 @@ pnpm add dsh-quick-restart
 
 ## 本地修复（fork 相对上游）
 
-本仓库是 [`bingshuang2014/dsh-quick-restart`](https://github.com/bingshuang2014/dsh-quick-restart) 的**本地 fork**（上游原作者 [`a994903574/dsh-quick-restart`](https://github.com/a994903574/dsh-quick-restart)，main 停在 0.1.1，基本无维护），基线是 0.1.1，版本号自 0.1.2 起。
+本仓库是 [`bingshuang2014/dsh-quick-restart`](https://github.com/bingshuang2014/dsh-quick-restart) 的**本地 fork**（上游原作者 [`a994903574/dsh-quick-restart`](https://github.com/a994903574/dsh-quick-restart)），基线是 0.1.1，版本号自 0.1.2 起。
+
+**上游版本谱系（已从 npm 拉原始 tarball 逐字节比对）**：
+
+| 版本 | `lib/index.js` | 相对 0.1.1 的增量 |
+|---|---|---|
+| 0.1.1 | 7,215 B | —（基线） |
+| 0.1.2 | 7,215 B | **无**（与 0.1.1 逐字节相同） |
+| 0.1.3 | 8,081 B | 仅新增 `embedHotRestart` 函数**定义**（**从未被调用**）+ `dependencies: { dsh-hot-restart: ^0.3.16 }` |
+| 0.1.4 | 8,081 B | 与 0.1.3 逐字节相同（latest） |
+
+也就是说：**上游三个版本加起来只多了"一段没人调用的函数 + 一条依赖声明"，没有其它功能进展；而 junction 修复与缓存击穿两条（①②）上游至今都没有。** 本 fork 是在这个基线上补的 ①②③④ 与三处收敛，功能上是 0.1.4 的超集（唯一没搬的是那段未调用的 `embedHotRestart`，见下表）。
+
 
 修的是**热重载静默失效**：接口返回 `{"ok":true}`，代码却根本没换。两个独立缺陷叠在一起：
 
@@ -100,6 +112,26 @@ pnpm add dsh-quick-restart
 4. 再读一次 → 标记**出现**了才算真的重载成功（没出现就还有第三层缓存）；同时看响应里的 `cleared`：`cleared: 0` 说明缺陷① 没修好；`cleared > 0` 但标记没变说明缺陷② 或 ③ 没修好；
 5. **把标记改成 `M2`（再写 `M3`），重复第 3–4 步**：每次重载后标记都必须跟着变。若第一次变了、后面不变，就是缺陷③（旧实例的 fiber 没被 dispose，新实例撞名抛错被异步吞掉）——**这时接口仍然返回 `ok:true` 与 `cleared>0`**；
 6. 验证完立刻删掉那个标记，并再重载一次恢复原状。
+
+## 结论适用范围（哪条结论基于哪份代码）
+
+**先说清楚：本仓库永远只维护 fork 这一份代码；上面「本地修复」的全部结论都基于 fork（0.1.1 → 0.1.2），不是 npm 上的版本。**
+
+历史上确实有多份代码同时存在过，结论容易张冠李戴，所以逐条标注：
+
+| 结论 | 依据的代码 | 适用范围 / 注意 |
+|---|---|---|
+| 「重启 DSH」靠内嵌 `embedHotRestart` 拉起 `dsh-hot-restart` | npm **0.1.4**（本机那份 12,941 B；2026-11-05 14:34 被就地打过补丁） | **只对那一份成立**。本 fork 没有该内嵌逻辑，重启能力靠 `dsh-hot-restart` 作为独立 bundle 加载 |
+| 「`embedHotRestart` 定义了但从未被调用（上游 issue #1）」 | 上游 0.1.4 的源码状态 | **与本机不符**：本机那份已被就地补上调用（注释日期 2026-11-03）。跨版本引用时别用这条 |
+| 四个缺陷（junction 前缀 / ESM ModuleMap / 同包只能重载一次 / apply 异常被吞） | 本 fork rev1→rev5 + `@deepseek-ai/cordis` 4.0.1 源码 + 真机实测 | 适用本 fork。npm 0.1.4 **同样有**「同包只能重载一次」和「apply 异常被吞」两处（它也没 `await`）；所以"0.1.4 是好的"只指它的**重启**按钮，不是它的重载 |
+| 「平台 `@deepseek-ai/dsh-hmr` 已覆盖上面四个缺陷」 | `app.asar` 里 `dsh-hmr@0.2.2-rc.1` 的 README + 抽出的 `lib/index.js`（61 KB） | 适用**该版本**；换 host 版本要重新确认 |
+| 「删掉本插件不影响重启能力」 | 实测（退役后 `/dsh-hot-restart/restart` 仍 401）+ bundle 元数据 | 适用当前 profile 布局：`dsh-hot-restart` 有自己的 `dependencies` 与 `dsh.profile.bundles` 条目 |
+| 「改 `dsh.profile.bundles` → 平台 hmr 会自动重组合」 | 实测两次 | **不对称**：移除（同时删 junction）会当场自动卸载；加回（先改 manifest、后建 junction）会因"那一刻文件还不存在"落到 `failed` 且**不自动重试**，需要再触发一次重组合（`plugin_manager set_bundle(false→true)`）。判定时看时点 |
+| 「上游 0.1.2–0.1.4 比 0.1.1 更完善」 | npm 四个版本的 pristine tarball（逐字节比对） | **基本不成立**：0.1.2=0.1.1、0.1.3=0.1.4=0.1.1 + 一段未调用的 `embedHotRestart` + 一条依赖声明 |
+| 「本机那份 12,941 B 的 `npm 0.1.4`」 | 上游 0.1.4（8,081 B）+ 约 4,860 B **本机就地补丁** | 它**已被我们改过**（补丁含 embed 的调用、①②、兜底、早抛），不是上游原样；引用它做对比时务必声明 |
+| 「重启按钮可用」的两种实现 | 实测 + 元数据 | 上游 0.1.3+ 的做法是**内嵌自举**（`import('dsh-hot-restart')`）；本 fork 不改代码，改由 `dsh-hot-restart` 作为 profile 的独立 bundle 提供。两者结果一致，后者在 `link:` 部署下才成立（裸 import 会从 fork 的 realpath 找 node_modules，找不到 profile 那份） |
+
+
 
 ## 卸载
 
