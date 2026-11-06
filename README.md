@@ -51,7 +51,7 @@ DSH 的第三方插件改了代码之后，默认要**完全退出再打开**才
 把这个地址填进 DSH 的插件安装入口：
 
 ```
-https://github.com/bingshuang2014/dsh-quick-restart/releases/download/v0.2.1/dsh-quick-restart-0.2.1.tgz
+https://github.com/bingshuang2014/dsh-quick-restart/releases/download/v0.2.2/dsh-quick-restart-0.2.2.tgz
 ```
 
 **方式二：从源码 link（开发用）**
