@@ -1,6 +1,6 @@
 {
   "name": "dsh-quick-restart",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "type": "module",
   "description": "DeepSeek Harness 插件：标题栏加两个按钮——重载第三方插件（不用重启宿主）、重启 DSH。",
   "keywords": [
@@ -72,6 +72,14 @@
         "why": "本地路径 registry.delete + registry.plugin 不 dispose loader entry 上的 fiber，旧实例的工具名 / prompt 段 / 服务 / 路由前缀会一直残留。宿主在一次 recompose 里逐条报出 7 条 already registered 并判 restart-required；插件管理器显示「未运行」（fiberPhase: null）是同一件事的另一面。",
         "how": "POST /reload 不带 packages 时调 ctx.hmr.runReload(() => hmr.reconcileProfile())；ctx.hmr 不可用或事务抛错则退回本地路径，并把 fellBack 原因如实带回。响应新增 engine / warnings / pending / restartReason / summary.failed。点名 packages 时仍走本地路径。",
         "verify": "实测 engine=platform、warnings=[]、无 restartReason、耗时约 1s；事后插件管理器 246 个条目全部 active（含各类插件），不再出现 null。"
+      },
+      {
+        "id": 12,
+        "date": "2026-11-06",
+        "title": "修按钮文案读错响应形状（会谎报「已重载 0 个」）",
+        "why": "第 11 条把默认路径改成平台事务后，响应从 { result:[...] } 变成 { engine:\"platform\", warnings, pending }，但 lib/client.js 仍只读 j.result。平台事务不带 result → list 恒为空 → 按钮永远显示「已重载 0 个」。这是「假成功」的翻版：后端对了、前端在说谎。",
+        "how": "fire() 按 engine 分流：platform 分支读 warnings/pending/restartReason（分别给「已重载」/「有 N 条警告」/「进行中 N」/「需重启」+ title 展开详情）；local 分支保留原逻辑，并在 fellBack 时给文案加「平台失败·已退回，」前缀。baseTitle 在 done() 后复原，避免 title 被上一次结果永久污染。",
+        "verify": "node --check lib/client.js 通过；从 /dsh-quick-restart/client.js 取到的是新脚本（7,211 B，含 engine === \"platform\" 分支）；实测响应 {\"ok\":true,\"engine\":\"platform\",\"warnings\":[],\"pending\":[]} 三字段均空 → 文案走 done(\"已重载\")，与事实相符。"
       }
     ],
     "knownBehaviorChange": "被重载模块里的 import.meta.url 会带上 ?dshReload=<ts>（击穿引擎级缓存的代价）。fileURLToPath 仍正常、相对依赖不会被复制成两份；但把 import.meta.url 拿去做字符串拼接的插件会看到多出来的 query。",
