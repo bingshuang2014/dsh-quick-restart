@@ -226,4 +226,19 @@ bot      (<plugin-b>):       prompt section "<section-b>" is already registered
 - **必须重启一次才生效**——`root` 是 HMR 插件**在自己加载时**读的；而且 `include:hmr` 被系统锁定（管理器返回 `management-required`，不能热开关）。
 - **默认 `ignored` 就含 `**/node_modules`**，所以别写 junction 路径，要写 `link:` 指向的真实目录。
 
-配好后实测（2026-11-06）：改 `lib/index.js` → **2 秒内**接口返回新字段；字节级还原 → **2 秒内**字段消失，全程没点任何按钮，窗口没动。
+配好后实测（2026-11-06）：**没测出效果**。
+
+> ⚠️ **更正（2026-11-06 晚，同一日二测）**：本节原写「改 `lib/index.js` → **2 秒内**接口返回新字段；
+> 字节级还原 → **2 秒内**字段消失，全程没点任何按钮」。**这句话是没有证据的，已作废。**
+>
+> 二测用的是可证伪的办法：在插件里加一个 `reloadMark` 字段（`/dsh-quick-restart/info` 读它），
+> 改文件后**等 3 秒再连读**，并同时观察进程 pid、`/dsh-quick-restart/info` 的版本号与启动时间。
+> 结果：**每一次都是无变化** —— 字段不出现，pid 不变，模块没被重新求值。
+>
+> 也就是说 `@deepseek-ai/dsh-hmr` 在这台机器上**从未真正触发过重载**，
+> 那次「2 秒内」很可能是**把上一次手动 reload 的效果记成了 HMR 自动生效**。
+>
+> 现在能真正生效的是本插件自己的 `POST /dsh-quick-restart/reload`（点名单个包，
+> 返回 `ok/cleared/propagation`，`propagation: 'ok'` 才算真重载）。
+> HMR 为什么完全不动，根因仍未找到 —— 见 `HMR排查交接.md`。
+
