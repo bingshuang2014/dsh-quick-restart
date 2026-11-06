@@ -37,13 +37,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/a994903574/dsh-quick-restart.git"
+    "url": "git+https://github.com/bingshuang2014/dsh-quick-restart.git"
   },
-  "homepage": "https://github.com/a994903574/dsh-quick-restart#readme",
+  "homepage": "https://github.com/bingshuang2014/dsh-quick-restart#readme",
   "bugs": {
-    "url": "https://github.com/a994903574/dsh-quick-restart/issues"
+    "url": "https://github.com/bingshuang2014/dsh-quick-restart/issues"
   },
-  "author": "a994903574",
+  "author": "bingshuang2014",
   "_upstream": {
     "note": "本地 fork，用于自维护「热重载静默失效」修复（共两个层次的假成功：报成功但没换代码、报成功但新实例根本没起来）。clone 自 bingshuang2014/dsh-quick-restart（上游原作者 a994903574/dsh-quick-restart）。基线 0.1.1；功能上是 npm 0.1.4 的**超集**（见 npmLineage）。本 fork 不新增任何运行时依赖，仍是纯 node: 内置模块。",
     "forkedFrom": "https://github.com/bingshuang2014/dsh-quick-restart",

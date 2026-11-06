@@ -217,28 +217,55 @@ bot      (<plugin-b>):       prompt section "<section-b>" is already registered
 - id: hmr
   name: "@deepseek-ai/dsh-hmr"
   config:
+    base: "file:///D:/你的插件父目录"    # ← 必须给；必须是 file:// URL
     root:
-      - "D:/你的插件真身目录"     # 注意：写 link: 目标的真身，不是 profile/node_modules 里的 junction
+      - "D:/你的插件真身目录"            # 写 link: 目标的真身，不是 profile/node_modules 里的 junction
+    ignored:                             # ← 必须给；必须写成反斜杠形式
+      - '**\\node_modules'
+      - '**\\node_modules\\**'
+      - '**\\.*'
+      - '**\\.*\\**'
 ```
 
-两个实测要点：
+四个实测要点：
 
-- **必须重启一次才生效**——`root` 是 HMR 插件**在自己加载时**读的；而且 `include:hmr` 被系统锁定（管理器返回 `management-required`，不能热开关）。
-- **默认 `ignored` 就含 `**/node_modules`**，所以别写 junction 路径，要写 `link:` 指向的真实目录。
+- **必须重启一次才生效** —— `root` / `base` 是 HMR 插件在**自己加载时**读的；而且 `include:hmr` 被系统锁定（管理器返回 `management-required`，不能热开关）。
+- **默认 `ignored` 含 `**/node_modules`**，所以别写 junction 路径，要写 `link:` 指向的真实目录。
+- **`base` 少了会让整件事静默失效**，且零日志 —— 见下节，这是最坑的一条。
+- **`ignored` 必须写成反斜杠形式**，否则 Windows 下默认那几条**一条都匹配不上**。
 
-配好后实测（2026-11-06）：**没测出效果**。
+### 为什么 `base` 是必须的（静默失效的根因）
 
-> ⚠️ **更正（2026-11-06 晚，同一日二测）**：本节原写「改 `lib/index.js` → **2 秒内**接口返回新字段；
-> 字节级还原 → **2 秒内**字段消失，全程没点任何按钮」。**这句话是没有证据的，已作废。**
->
-> 二测用的是可证伪的办法：在插件里加一个 `reloadMark` 字段（`/dsh-quick-restart/info` 读它），
-> 改文件后**等 3 秒再连读**，并同时观察进程 pid、`/dsh-quick-restart/info` 的版本号与启动时间。
-> 结果：**每一次都是无变化** —— 字段不出现，pid 不变，模块没被重新求值。
->
-> 也就是说 `@deepseek-ai/dsh-hmr` 在这台机器上**从未真正触发过重载**，
-> 那次「2 秒内」很可能是**把上一次手动 reload 的效果记成了 HMR 自动生效**。
->
-> 现在能真正生效的是本插件自己的 `POST /dsh-quick-restart/reload`（点名单个包，
-> 返回 `ok/cleared/propagation`，`propagation: 'ok'` 才算真重载）。
-> HMR 为什么完全不动，根因仍未找到 —— 见 `HMR排查交接.md`。
+`dsh-hmr` 的 ignored 回调是：
+
+```js
+ignored: (path) => picomatch(ignored)(relative(watchBaseDir, path))
+```
+
+`watchBaseDir` 默认取 `config.base`；不配就是 `dsh-hmr` 自己的目录（在 `app.asar` 里）。
+而 `root` 是绝对路径 → 两者不在同一棵树下 → `relative()` 算出 `..\..\..\0data\...` 这种串。
+picomatch 把 `.` 开头的段当隐藏文件，默认 `ignored` 里的 **`**/.*`** 一条就命中它。
+
+**于是文件在 chokidar 层就被 ignored 掉，`changed` 集合永远为空，`dispatch` 提前 return —— 连一行 warn 都不打。**
+这就是「配了、看着也对，但保存完全没反应，也不报错」的全部原因。
+
+补上 `base` 之后又有个连带坑：`relative()` 这时返回 Windows 原生**反斜杠**路径，而 picomatch 不把 `\`
+当分隔符（`picomatch(['**/node_modules'])('a\\node_modules') === false`），默认 `ignored` 会**全部失效**，
+watcher 转头去监听整个 `node_modules` 和 `.git` —— 所以必须显式写反斜杠版。
+
+另外 `base` **不能写纯路径**：`new URL('D:/x', baseUrl)` 会解析成 `d:/x`（无 scheme），
+`fileURLToPath()` 随后抛 `ERR_INVALID_URL_SCHEME`，插件启动直接失败。要么 `file:///D:/...`，
+要么相对 `ctx.baseUrl` 的 `../..` 链。
+
+### 实测结论（2026-11-06 收尾，已线上验收）
+
+改一个字符串后 **+1.1 秒**接口返回值就变，进程 pid **不变**（桌面窗口不动）—— 这正是要的「窗口不变、插件更新」。
+
+定位办法：从 `app.asar` 抽出与宿主**同版本**的 chokidar 5.0.0 + picomatch，在独立进程里 1:1 复刻 `configure()`，
+跑 A/B 对照。旧配置（无 `base`）4 个探针目录收到 **0 条 change**；新配置 **4/4 全部收到**，且 `node_modules` 探针被正确忽略。
+旧配置的表现与线上「保存无任何反应」完全吻合。
+
+> ⚠️ 本节历史版本两次写错：先写「改 `lib/index.js` → 2 秒内生效，全程没点按钮」（无证据，已作废），
+> 后更正为「没测出效果、根因未找到」。**两次都不准确** —— 真相是配置缺 `base` 导致 HMR 从未被触发，现已修复。
+> 完整排查记录见 `HMR排查交接.md`（该文件含本机路径，不随包发布）。
 

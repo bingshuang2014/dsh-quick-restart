@@ -23,6 +23,7 @@
 | 4 | 不点名重载时**静默 fallback**，调用方看不出「平台事务失败过」 | 中（掩盖问题） | 部分（有 `fellBack` 字段） | 响应实测 |
 | 5 | `?dshReload=` query 会让插件的 `import.meta.url` 带上参数 | 低（已知副作用，已写注释） | 已记录未修 | 独立实验 |
 | 6 | README 与实际行为不符（多处） | 低 | 未修 | 文档比对 |
+| 7 | **平台 HMR 在 Windows 下静默失效**（`root` 配绝对路径且未配 `base`） | **高**（「保存即生效」完全不可用，且零日志） | 配置层已绕过，**框架层未修** | 宿主源码 + A/B 对照 + 线上验收 |
 
 ---
 
@@ -345,7 +346,105 @@ POST /dsh-hot-restart/restart      -> 401   ← 另一个插件，需要它自�
 |---|---|---|
 | `/reload` 的自定义头 | README 未写 `x-dsh-quick-restart: 1`。这是**安全设计**（防 CSRF，实测有效：缺头、`Origin: null` 都被 403），但没文档，外部调用方会以为接口坏了 | 在 README 边界节补一句「`/reload` 只接受同源请求且需自定义头；没有对外 API」 |
 | 「重启」按钮的依赖 | README L25/L87/L88 **已经写对了**（「需要 `dsh-hot-restart` 提供引擎」「没装也能用重载，只是重启那颗点了没反应」） | 无需改。**本报告早先版本写「安装说明指向 dsh-hot-restart」是错的**，核查后已删除该条 |
-| 平台 HMR 的记载 | `docs/dev-notes.md` 原写「改文件 2 秒内生效，全程没点按钮」，实测不成立 | 已在 `379ed2c` 标注**作废**，更正为「没测出效果」，并说明二测用可证伪办法 |
+| 平台 HMR 的记载 | `docs/dev-notes.md` 原写「改文件 2 秒内生效，全程没点按钮」，实测不成立 | 已在 `4620739` 标注**作废**，更正为「没测出效果」，并说明二测用可证伪办法 |
+
+---
+
+## 问题 7：平台 HMR 在 Windows 下会**静默失效**（框架侧，零日志）
+
+> 这条严格说属于 `@deepseek-ai/dsh-hmr`，不属于本插件。放进来是因为它和问题 2/3/4 同属
+> 「平台侧反馈缺失」，而且它直接决定本插件的自动重载能力到底能不能用。
+
+### 现象
+
+给 `dsh-hmr` 配 `root: ["D:/.../某插件"]`（**绝对路径**）、但没配 `config.base` 时：
+
+**保存任何文件后什么都不会发生** —— 不改代码、不报错、不打日志，等 40 秒也一样。
+不是「慢」，是**根本没被触发**。
+
+### 根因（逐行读宿主源码定位）
+
+`dsh-hmr` 的 `configure()`：
+
+```js
+const match = picomatch(ignored);
+const watchBaseDir = realpathSync(this.baseDir);
+this.watcher = watch(root, {
+  ...this.config,
+  cwd: watchBaseDir,
+  ignored: (path) => match(relative(watchBaseDir, path)),
+  ignoreInitial: true
+});
+```
+
+其中 `baseDir = fileURLToPath(new URL(config.base || ".", ctx.baseUrl))`。
+
+`root` 是绝对路径而 `base` 没配 → `watchBaseDir` 落到 `dsh-hmr` **自己的目录**（在 `app.asar` 里），
+两者不在同一棵树下，`relative()` 于是算出带 `..` 段的串：
+
+```
+..\..\..\..\..\..\..\0data\0dsh\某插件\version.js
+```
+
+picomatch 把以 `.` 开头的段当隐藏文件，默认 `ignored` 里的 **`**/.*`** 一条就命中它
+（实测 `picomatch(['**/.*'])('..\\..\\x.js') === true`）。
+
+**结果：文件在 chokidar 层就被 ignored，`changed` 集合永远为空，`dispatch` 提前 return —— 连一行 warn 都没有。**
+这解释了为什么它看起来像「什么都正常，就是不生效」。
+
+### 第二个坑（修好第一个才会撞上）
+
+补上 `base` 之后，`relative()` 返回 Windows 原生**反斜杠**路径，而 **picomatch 不把 `\` 当路径分隔符**：
+
+```js
+picomatch(['**/node_modules'])('a\\node_modules')  // false
+```
+
+于是默认的 `**/node_modules`、`**/.*` 在 Windows 上**一条都匹配不上** —— watcher 会老老实实去监听
+整个 `node_modules` 和 `.git`。
+
+### 修法（配置层，不用改框架代码）
+
+```yaml
+- id: hmr
+  name: "@deepseek-ai/dsh-hmr"
+  config:
+    base: "file:///D:/0data/0dsh"     # 插件共同父目录，必须是 file:// URL
+    root:
+      - "D:/0data/0dsh/某插件"
+    ignored:                          # 必须写成反斜杠形式
+      - '**\\node_modules'
+      - '**\\node_modules\\**'
+      - '**\\.*'
+      - '**\\.*\\**'
+```
+
+两个必须注意的点：
+
+- `base` **不能写纯路径**：`new URL('D:/0data/0dsh', baseUrl)` 会解析成 `d:/0data/0dsh`（无 scheme），
+  `fileURLToPath()` 随后抛 `ERR_INVALID_URL_SCHEME`，插件**启动直接失败**。可用写法只有
+  `file:///D:/...` 或相对 `ctx.baseUrl` 的 `../..` 链。
+- watcher 在 `configure()` 时创建，**改配置要重启一次 DSH** 才会重建；之后所有源码保存都不再需要重启。
+
+### 证据（A/B 对照 + 线上验收）
+
+用与宿主**同版本**的 chokidar 5.0.0 + picomatch（从 `app.asar` 抽出）在独立进程里 1:1 复刻 `configure()`，
+喂同一套探针文件：
+
+| 配置 | 4 个插件目录各自收到 change | node_modules 探针 |
+|---|---|---|
+| 旧（无 `base`，用默认 ignored） | **0 条**（全部） | — |
+| 新（`base` + 反斜杠 ignored） | **4/4 全部收到** | ✓ 被正确忽略 |
+
+旧配置连一条 change 都没收到，与线上「保存无任何反应」完全吻合。
+
+修好后线上验收：改一个字符串，**+1.1 秒**接口返回值就变了，进程 pid **不变**（桌面窗口不动）。
+
+### 建议
+
+1. 别把 `relative()` 的结果直接当 glob 输入 —— 先 `normalize`，或干脆用前缀判定代替 glob
+2. Windows 下把分隔符统一成 `/` 再喂 picomatch（或用 `picomatch(..., { windows: true })`）
+3. **失败路径至少要打一行 `warn`** —— 本次根因能潜伏这么久，唯一原因就是它完全静默
 
 ---
 
@@ -379,12 +478,12 @@ POST /dsh-hot-restart/restart      -> 401   ← 另一个插件，需要它自�
 
 | 改动 | 提交 | 说明 |
 |---|---|---|
-| `realpathSync.native` 解析 junction 前缀 | `a196982` 前 | 否则 `cleared` 恒为 0 |
-| `?dshReload=<ts>` 击穿 ESM 缓存 | `a196982` 前 | 否则清完缓存还是旧代码 |
-| `registerHooks` 传播 query 到相对依赖 | `a196982` | 否则只换入口 |
-| 响应加 `propagation` 字段 | `a196982` | `cleared>0` 不证明依赖也换了 |
-| `await registry.plugin()` + 5s 超时 | `a196982` 前 | 否则 `apply()` 抛错被吞成 `ok:true` |
-| 优先走平台事务 + fallback | `a196982` 后 | 见问题 2 |
-| POST 自定义头 + 同源双闸 | `210f359` | 防 CSRF |
+| `realpathSync.native` 解析 junction 前缀 | `e7a2db7` 前 | 否则 `cleared` 恒为 0 |
+| `?dshReload=<ts>` 击穿 ESM 缓存 | `e7a2db7` 前 | 否则清完缓存还是旧代码 |
+| `registerHooks` 传播 query 到相对依赖 | `e7a2db7` | 否则只换入口 |
+| 响应加 `propagation` 字段 | `e7a2db7` | `cleared>0` 不证明依赖也换了 |
+| `await registry.plugin()` + 5s 超时 | `e7a2db7` 前 | 否则 `apply()` 抛错被吞成 `ok:true` |
+| 优先走平台事务 + fallback | `e7a2db7` 后 | 见问题 2 |
+| POST 自定义头 + 同源双闸 | `ebfcb96` | 防 CSRF |
 
 **问题 1 我没修**，因为需要作者先确认第 3 个问题（`delete()` 丢弃 Promise 是否有意）。
