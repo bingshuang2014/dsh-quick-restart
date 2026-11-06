@@ -46,15 +46,19 @@ DSH 的第三方插件改了代码之后，默认要**完全退出再打开**才
 
 ## 安装
 
-**从 GitHub Release 装（已发布）**
+**方式一：从 Release 装（推荐）**
+
+从 [Releases](https://github.com/bingshuang2014/dsh-quick-restart/releases) 下载最新 `.tgz`，把地址或文件填进 DSH 的插件安装入口。
+
+**方式二：从源码 link（开发用）**
 
 ```
-https://github.com/a994903574/dsh-quick-restart/releases/download/v0.1.1/dsh-quick-restart-0.1.1.tgz
+git clone https://github.com/bingshuang2014/dsh-quick-restart.git
 ```
 
-把这个地址填进 DSH 的插件安装入口即可。
+然后在该目录执行 `pnpm link`，或把目录 junction 进 profile 的 `node_modules`。
 
-**从 npm 装（尚未发布）** —— DSH 设置页 →「插件」→ 搜索 `dsh-quick-restart` → 安装。
+> **npm 上那个 `dsh-quick-restart` 不是这个 fork** —— 它属于另一位作者（`a994903574`），停在 0.1.4，没有上面这些修复。这个 fork 没有发布到 npm，请从 GitHub 装。
 
 > 首次装完必须**完全退出 DSH 再打开**一次：按钮要用宿主启动时收集的注入表，装完即时不会出现。
 
