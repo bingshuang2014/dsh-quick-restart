@@ -2,11 +2,14 @@
 
 > 提交给插件作者的问题清单。所有结论都标注了**证据来源**；凡是没验证的都明确写「未验证」。
 >
-> 排查环境：DeepSeek Harness `0.2.2-rc.1`（Electron 44.7.0）、Windows、本 fork 基于上游 `0.1.4`。
+> 排查环境：DeepSeek Harness `0.2.2-rc.1`（Electron 44.7.0）、Windows。
 > 本机环境标识（宿主端口、第三方插件名与其资源名）已匿名化为 `<PORT>`、`<pkg-a>` 这类占位符；
 > 错误模板本身的原文保持不变，因为它才是要修的东西。
+> 本 fork 代码基线是上游 `0.1.1`（`package.json` 的 `_upstream.baseVersion`）；功能上是 npm `0.1.4` 的超集，
+> 曾把 4 个 npm tarball（0.1.1→0.1.4）拉下来逐字节比对，见 `package.json` 的 `_upstream.npmLineage`。
 > 本 fork 版本 `0.2.2`。以下问题**均已在本机真实宿主上复现**，不是静态推断。
 > 「证据强度」列写的是我实际做到哪一步：**宿主源码**=逐行读过被依赖包的实现；**真机复现**=在运行的宿主上调接口实测。
+> 行号引用均以本 fork `0.2.2`（`lib/index.js` 共 442 行）为准，上游行号会偏移。
 
 ---
 
@@ -67,9 +70,13 @@ delete(plugin) {
 
 JSDoc 写的是 *"Dispose every running fiber for a plugin and remove its runtime record"* —— 意图是对的，`fiber.dispose()` 也确实被调用了。
 
+> **回源方式**（可复现）：从 `app.asar` 用 asar 头部布局取文件，上面这段是
+> `/dsh/node_modules/@deepseek-ai/cordis/src/registry.ts` 的**逐字原文**，不是转述。
+> 同一份源码在 asar 里有两处（`/node_modules/` 和 `/dsh/node_modules/`），内容一致。
+
 **第三层**：`fiber.dispose()` 返回的是 **Promise**
 
-宿主 `app.asar` 里 `Fiber` 类的字段声明：
+宿主 `app.asar` 里 `Fiber` 类的字段声明（`fiber.ts` L194，逐字）：
 
 ```ts
 /** Dispose this fiber: unload the plugin, then settle once cleanup finished. */
@@ -90,7 +97,9 @@ fiber = registry.plugin(newPlugin, fiberConfig, () => [])
 
 ### 为什么这个解释可信
 
-宿主 `@deepseek-ai/dsh-loader` 里有段注释明确列出了这个场景（`app.asar` 内，`FiberState` 附近）：
+宿主 `@deepseek-ai/cordis-plugin-loader` 里有段注释明确列出了这个场景
+（`app.asar` → `/dsh/node_modules/@deepseek-ai/cordis-plugin-loader/src/index.ts`，
+在 `ctx.on('internal/plugin', ...)` 回调里，逐字）：
 
 ```
 // case 4: fiber is disposed on behalf of plugin deletion (such as plugin hmr)
@@ -98,27 +107,88 @@ fiber = registry.plugin(newPlugin, fiberConfig, () => [])
 // plugin hmr: delete(plugin) -> runtime dispose -> fiber dispose
 ```
 
+> 出处更正：本报告早先版本写的是 `dsh-loader`，实际在 `cordis-plugin-loader`。
+> 全文用 asar 内所有 `.js/.ts/.mjs/.cjs` 做全文检索，只有这一个文件命中 `plugin hmr: delete(plugin)`。
+
 `plugin hmr: delete(plugin) -> runtime dispose -> fiber dispose` 就是我们在做的事，宿主**把它当成一个已知路径**，并且在这条路径上 Fiber 状态机要处理"删除中"的中间态。我们不等它 settle，等于跳过了状态机。
 
 ### 建议的修法
+
+⚠️ **先纠一个坑**：`runtime.fibers` 的类型是 `DisposableList<Fiber>`，**不是数组**。
+它是 cordis 自定义的有序集合（`lib/index.js` 里的 `var DisposableList = class {...}`），
+有 `length` / `push` / `delete` / `clear` / `[Symbol.iterator]`，**没有 `Array.isArray` 认的那种索引**。
+所以直觉写法会静默失效：
+
+```js
+// ❌ 永远进不去：Array.isArray(new DisposableList()) === false
+if (rt && Array.isArray(rt.fibers)) { ... }
+```
+
+正确写法（用迭代器）：
 
 ```js
 const removals = []
 for (const old of new Set([entryPlugin, lastPlugin])) {
   if (!old) continue
   try {
-    const rt = registry.delete(old)
-    // delete() 返回 runtime；runtime.fibers 里的 dispose Promise 要自己收集
-    if (rt && Array.isArray(rt.fibers)) {
-      for (const f of rt.fibers) removals.push(Promise.resolve(f.dispose?.() ?? f.inertia))
+    const rt = registry.delete(old)          // delete() 内部已触发 dispose()，Promise 被丢弃
+    if (rt && rt.fibers) {
+      for (const f of rt.fibers) {           // DisposableList 可迭代
+        // 关键：dispose() 已被调用过一次，再调一次可能抛 INACTIVE_EFFECT
+        // 所以优先等 inertia，而不是重复 dispose
+        if (f.inertia) removals.push(Promise.resolve(f.inertia))
+      }
     }
   } catch { /* 已经没了就算了 */ }
 }
-// 等旧实例真正卸干净，再装新的
 if (removals.length) await Promise.allSettled(removals)
 ```
 
-或者更稳的做法：**用 `fiber.inertia`**（宿主 `Fiber` 类里有 `public inertia: Promise<void> | undefined`，注释是 *"The in-flight load/unload transition, if one is currently running"*），即「正在进行的装卸转换」。等它 settle 才是真正的「这个 fiber 已经停稳」。
+**但更稳的做法是用 `fiber.await()`**，顺带把加载期的异常也抛出来：
+
+```js
+const waits = []
+for (const old of new Set([entryPlugin, lastPlugin])) {
+  if (!old) continue
+  try {
+    const rt = registry.delete(old)
+    if (rt && rt.fibers) for (const f of rt.fibers) waits.push(f.await())
+  } catch { /* 已经没了就算了 */ }
+}
+await Promise.allSettled(waits)   // 用 allSettled：一个包卸载失败不该拦住别的包
+```
+
+> **注意 `await()` 能捕获什么、不能捕获什么**（读了 `fiber.ts` 原文）：
+>
+> - **能**抛 `apply()` 期失败 —— `_error` 在 `_execute()` 的 catch 里被赋值：
+>   `catch (reason) { this.ctx.logger.error(reason); if (...) { this._error = reason } }`
+> - **不能**抛卸载期失败 —— 源码注释自己写着：
+>   *"`this.inertia` itself should never reject — both `_reload` and `_unload` swallow their own work errors via `ctx.logger.error`."*
+>
+> 也就是说：**effect undo 里抛的错只进日志，任何 await 都等不到它。** 这是问题 1 的
+> 「随机撞名」为什么表现为随机——卸载确实在跑，只是失败了也没人知道。
+> 所以 `await` 只能解决「**时序**」（别在别人还没卸完时装新的），不能解决「**卸载本身失败**」。
+
+> 为什么不是「收集 `f.dispose()` 的返回值」：`delete()` **内部已经调过 `fiber.dispose()`** 了。
+> `dispose` 是 `parent.fiber.effect(...)` 注册出来的 disposer，重复调用会因 `uid` 已清而命中
+> `assertActive()` 的 `INACTIVE_EFFECT`。等 `inertia` 或 `await()` 才是安全的二次观测。
+
+或者更稳的做法：**用 `fiber.inertia`**（宿主 `Fiber` 类里有 `public inertia: Promise<void> | undefined`，`fiber.ts` L200，注释是 *"The in-flight load/unload transition, if one is currently running"*），即「正在进行的装卸转换」。等它 settle 才是真正的「这个 fiber 已经停稳」。
+
+**另一个可用的句柄是 `fiber.await()`**，实测其实现就是「等 inertia 链清空，再把错误抛出来」（`fiber.ts`，逐字）：
+
+```ts
+async await() {
+  while (this.inertia) {
+    await this.inertia
+  }
+  if (this._error) throw this._error
+  return this
+}
+```
+
+这也印证了本 fork 在 `registry.plugin()` 上 `await` 的必要性：不 await 时 `_error` 永远不会被读出来，`apply()` 抛的错只进 logger，接口照旧 `ok:true`。
+注意 `while (this.inertia)` 是**循环**——说明一次 await 可能跨多段转换，这更说明「不等就注册」是不可靠的。
 
 ### 验证方法（我这边怎么复现的）
 
@@ -167,7 +237,7 @@ if (removals.length) await Promise.allSettled(removals)
 
 ## 问题 3：`reloadViaPlatform()` 把结构化失败压成字符串
 
-`lib/index.js:303-312`：
+`lib/index.js:315-324`：
 
 ```js
 async function reloadViaPlatform() {
@@ -217,7 +287,7 @@ async function reloadViaPlatform() {
 
 **问题**：`ok: true` + `engine: 'local'` + `fellBack: "..."` 这个组合，语义是「我说的那件事（平台重组）失败了，但我做了另一件事（本地重载）并成功了」。但：
 
-- 上游版本的客户端**不认识** `fellBack`（`client.js` 是本 fork 加的展示）
+- 上游版本的客户端**不认识** `fellBack`（`client.js` 是本 fork 加的展示；本 fork 的 `client.js` 是认识的，按 `engine` 分支读两种响应形状）
 - 任何只看 `ok` 的调用方都会以为「一切正常」
 - 而 `engine: 'local'` 意味着**只有入口模块和它的相对依赖被换掉了**，平台层的配置/governance 重组**根本没做**
 
@@ -251,15 +321,31 @@ async function reloadViaPlatform() {
 
 ---
 
-## 问题 6：README 与实际行为不符
+## 问题 6：文档没写清「重启按钮依赖另一个插件」
 
-| README 说什么 | 实际是什么 |
-|---|---|
-| （早先版本）「HMR 2 秒内生效」 | 平台 HMR 在本机**完全不触发**，只能靠点名重载。已在 `379ed2c` 更正 |
-| 安装说明指向 `dsh-hot-restart` | 该依赖的 `embedHotRestart` 定义了但从未被调用 → 重启路由 404 |
-| 未说明 `x-dsh-quick-restart: 1` 这个自定义头 | 不带这个头，所有 POST 被拒 |
+### 现象
 
-最后一条尤其重要：**这个头是安全设计（防 CSRF），但没有文档**，外部调用方会以为接口坏了。
+「重启」按钮不是本插件实现的，它 POST 到 `/dsh-hot-restart/restart` —— 由 `dsh-hot-restart` 提供引擎。
+本插件只注册了两个路由（`/dsh-quick-restart/info` 和 `/dsh-quick-restart/reload`），**没有** restart 路由。
+
+实测（本机，宿主端口 `<PORT>`）：
+
+```
+GET  /dsh-quick-restart/info       -> 200
+GET  /dsh-quick-restart/reload     -> 403   （GET 不带 fence 头，符合预期）
+POST /dsh-quick-restart/reload     -> 403   （缺 x-dsh-quick-restart 头）
+POST /dsh-quick-restart/reload     -> 403   （带头但 Origin: null）
+GET  /dsh-quick-restart/restart    -> 404
+POST /dsh-hot-restart/restart      -> 401   ← 另一个插件，需要它自己的鉴权
+```
+
+### 需要改的地方
+
+| 项 | 问题 | 建议 |
+|---|---|---|
+| `/reload` 的自定义头 | README 未写 `x-dsh-quick-restart: 1`。这是**安全设计**（防 CSRF，实测有效：缺头、`Origin: null` 都被 403），但没文档，外部调用方会以为接口坏了 | 在 README 边界节补一句「`/reload` 只接受同源请求且需自定义头；没有对外 API」 |
+| 「重启」按钮的依赖 | README L25/L87/L88 **已经写对了**（「需要 `dsh-hot-restart` 提供引擎」「没装也能用重载，只是重启那颗点了没反应」） | 无需改。**本报告早先版本写「安装说明指向 dsh-hot-restart」是错的**，核查后已删除该条 |
+| 平台 HMR 的记载 | `docs/dev-notes.md` 原写「改文件 2 秒内生效，全程没点按钮」，实测不成立 | 已在 `379ed2c` 标注**作废**，更正为「没测出效果」，并说明二测用可证伪办法 |
 
 ---
 
@@ -267,7 +353,12 @@ async function reloadViaPlatform() {
 
 1. **`reconcileProfile()` 对「无变化」的包，是 dispose 后重装，还是直接再 apply 一次？** → 决定问题 2 是"平台的 bug"还是"插件的幂等义务"。
 2. **`fiber.inertia` 是否就是官方推荐的"等 fiber 停稳"的句柄？** 我打算用它来修问题 1，但想要作者确认这不是内部字段。
+   （我读到的是 `public inertia`，公开可见、有 JSDoc，但没在任何 `.d.ts` 导出文档里见过。）
 3. **`registry.delete()` 丢弃 `fiber.dispose()` 的 Promise 是故意的吗？** 如果是（比如上层有别的同步点保证顺序），那问题 1 的修法就要换。
+4. **卸载期异常被 `_unload()` 吞进 logger，是设计如此吗？**
+   源码注释明确说 `inertia` 永不 reject、`_reload`/`_unload` 自己用 `ctx.logger.error` 吞掉。
+   后果是：**effect undo 失败时，外部没有任何办法知道**。如果这是有意的（认为 undo 不该失败），
+   那问题 1 的"随机撞名"就永远只能靠超时/重试兜，而不能靠等信号解决。这一点对修法影响最大。
 
 ---
 
