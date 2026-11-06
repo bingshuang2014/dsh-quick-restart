@@ -1,6 +1,6 @@
 {
   "name": "dsh-quick-restart",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "description": "DeepSeek Harness 插件：标题栏加两个按钮——重载第三方插件（不用重启宿主）、重启 DSH。",
   "keywords": [
@@ -64,7 +64,15 @@
       "④之二 必须 await registry.plugin(...) 的返回值：它返回 thenable（cordis src/registry.ts:331-334），await 才走 fiber.await()，而 fiber.await() 会把 apply 抛出的异常重新抛出来。不 await 的话 apply 失败只进 logger、接口照旧 ok:true —— 这是「假成功」最深的一层，四版代码（含上游）都没 await，是独立验证用真实 cordis 库实测出来的。实现上带 5 秒超时（依赖一直不满足时按「已注册、仍在加载」放过），抛错则如实失败并尝试回滚旧实例。",
       "健壮性：非 file: 模块提前抛「非 file: 模块无法热重载」，不再让 fileURLToPath 抛 scheme 错误。",
       "曾评估但不采用：「前缀 0 命中时按父目录名松匹配」的兜底。独立验证确证它会误删跨盘同名包的缓存，而其动机（.pnpm 硬链接目录）在本机不存在 —— 宁可不猜，让 cleared: 0 如实暴露。",
-      "明确不移植上游 0.1.3+ 的 embedHotRestart：① 上游自己都没调用它（定义了但从未被调用）；② 在 link: 部署下裸 import('dsh-hot-restart') 必然失败 —— Node 从模块的 realpath（<workspace>\\lib\\）逐级向上找 node_modules，找不到 profile 里那份，失败还会被 try/catch 吞成一行日志；③ 重启引擎改由 dsh-hot-restart 作为 profile 的独立 bundle 提供，结果一致（实测 /dsh-hot-restart/restart 路由在、按钮可用）。"
+      "明确不移植上游 0.1.3+ 的 embedHotRestart：① 上游自己都没调用它（定义了但从未被调用）；② 在 link: 部署下裸 import('dsh-hot-restart') 必然失败 —— Node 从模块的 realpath（<workspace>\\lib\\）逐级向上找 node_modules，找不到 profile 里那份，失败还会被 try/catch 吞成一行日志；③ 重启引擎改由 dsh-hot-restart 作为 profile 的独立 bundle 提供，结果一致（实测 /dsh-hot-restart/restart 路由在、按钮可用）。",
+      {
+        "id": 11,
+        "date": "2026-11-06",
+        "title": "「重载」优先走平台第一方事务（hmr.reconcileProfile）",
+        "why": "本地路径 registry.delete + registry.plugin 不 dispose loader entry 上的 fiber，旧实例的工具名 / prompt 段 / 服务 / 路由前缀会一直残留。宿主在一次 recompose 里逐条报出 7 条 already registered 并判 restart-required；插件管理器显示「未运行」（fiberPhase: null）是同一件事的另一面。",
+        "how": "POST /reload 不带 packages 时调 ctx.hmr.runReload(() => hmr.reconcileProfile())；ctx.hmr 不可用或事务抛错则退回本地路径，并把 fellBack 原因如实带回。响应新增 engine / warnings / pending / restartReason / summary.failed。点名 packages 时仍走本地路径。",
+        "verify": "实测 engine=platform、warnings=[]、无 restartReason、耗时约 1s；事后插件管理器 246 个条目全部 active（含各类插件），不再出现 null。"
+      }
     ],
     "knownBehaviorChange": "被重载模块里的 import.meta.url 会带上 ?dshReload=<ts>（击穿引擎级缓存的代价）。fileURLToPath 仍正常、相对依赖不会被复制成两份；但把 import.meta.url 拿去做字符串拼接的插件会看到多出来的 query。",
     "howToVerify": "POST /dsh-quick-restart/reload {\"confirm\":true,\"packages\":[\"<pkg>\"]} 看响应里的 cleared；真正判据是「可观测标记」对照实验：改一处 health 返回值 → 重载 → 字段出现。必须**连续做 3 次**（M1→M2→M3），因为缺陷④ 只在第二次以后暴露。详见 README 的「本地修复」小节。"

@@ -49,7 +49,51 @@ pnpm add dsh-quick-restart
 - **重启按钮依赖 `dsh-hot-restart`**。没装也能用"重载"，只是重启那颗点了没反应。
 - **本插件不再隐藏 `dsh-hot-restart` 自带的浮动按钮**（2026-11-05 起）：标题栏两颗 + 原版那颗「热重启 dsh」**并存**，点下去是同一个引擎。原因是标题栏按钮依赖"宿主启动时一次性收集的注入表"，这次没赶上就不会出现——那时若把原版浮动按钮藏着，用户一个重启入口都没有（真机发生过）。
 - **重载之后，插件管理器里被重载的那个插件可能显示 `fiberPhase: null`**（看起来像"没起来"）。这只是本插件换 fiber 的副作用：loader entry 里的原 fiber 被停掉，新实例由本插件自己注册进 registry，管理器读 entry 时就读不到相位了。**功能不受影响**（实测：重载后目标插件的页面与 health 均 200）。
+  > **2026-11-06 更新：这条已被根治。** 现在「重载」默认走**平台第一方事务**（见下节），由平台自己停/起 loader entry，账目一致，不再出现 `null`。只有你点名 `{"packages":[...]}` 单独救某个包时，才会走本地那条路径、才可能出现该副作用。
 - 仅测试于 **Windows 桌面版**。其他平台未验证。
+
+## 两级引擎：优先平台事务，本地路径做兜底
+
+「重载」不是只有一种做法，本插件现在分两级：
+
+| 优先级 | 引擎 | 触发条件 | 行为 |
+|---|---|---|---|
+| 1 | **平台第一方** `@deepseek-ai/dsh-hmr` 的 `reconcileProfile()` | 默认（POST body 不带 `packages`） | 比对磁盘 → 停 loader entry（真 dispose）→ `recomposeProfile()` → 用新文件重启 entry → 判定激活。**账目一致、无孤立注册、无 `restart-required`** |
+| 2 | 本地（本项目自有实现） | `ctx.hmr` 不可用 / 平台事务抛错 / 显式点名 `{"packages":[...]}` | `registry.delete(旧)` + `import(带缓存击穿)` + `registry.plugin(新)`，精确控制「只重载这几个包」 |
+
+为什么要有第 1 级——**宿主自己把根因说出来了**。2026-11-05 用插件管理器触发一次重组合时，宿主逐条报出：
+
+```
+browser  (<plugin-i>):  tool "<tool-c>" is already registered
+<plugin-a> (<plugin-a>): prompt section "<section-a>" is already registered
+bot      (<plugin-b>):       prompt section "<section-b>" is already registered
+<plugin-c>  (<plugin-c>):      service "<service-a>" has been registered at <pet>
+<plugin-d>:              webserver: duplicate prefix route "/<plugin-d>"
+<plugin-e>:             tool "<tool-b>" is already registered
+<plugin-f>:       service "<service-b>" has been registered
+→ application: "restart-required"
+```
+
+这 7 个正是被本地路径换过的那 7 个包。也就是说：**本地那条路径会把旧实例的注册留在原地**（工具名 / prompt 段 / 服务 / 路由前缀），旧 fiber 从未被 dispose；而平台一碰上这些残留就判 `restart-required`。**插件管理器显示"未运行"是同一件事的另一面**（`fiberPhase: null`）。第 1 级引擎从根上避开它。
+
+### 想让「保存文件即生效」？（可选，一次性配置）
+
+平台 HMR 默认 `root: []`（= 不监听源码），所以「改完代码不生效」是**默认行为**。要开自动重载，在 profile 的 `cordis.patch.yml` 加：
+
+```yaml
+- id: hmr
+  name: "@deepseek-ai/dsh-hmr"
+  config:
+    root:
+      - "D:/你的插件真身目录"     # 注意：写 link: 目标的真身，不是 profile/node_modules 里的 junction
+```
+
+两个实测要点：
+
+- **必须重启一次才生效**——`root` 是 HMR 插件**在自己加载时**读的；而且 `include:hmr` 被系统锁定（管理器返回 `management-required`，不能热开关）。
+- **默认 `ignored` 就含 `**/node_modules`**，所以别写 junction 路径，要写 `link:` 指向的真实目录。
+
+配好后实测（2026-11-06）：改 `lib/index.js` → **2 秒内**接口返回新字段；字节级还原 → **2 秒内**字段消失，全程没点任何按钮，窗口没动。
 
 ## 本地修复（fork 相对上游）
 
@@ -93,8 +137,17 @@ pnpm add dsh-quick-restart
 `POST /dsh-quick-restart/reload` 的响应长这样：
 
 ```json
-{ "ok": true, "result": [ { "pkg": "<plugin-a>", "ok": true, "cleared": 31 } ] }
+// 默认：走平台第一方事务（2026-11-06 起）
+{ "ok": true, "engine": "platform", "warnings": [], "pending": [] }
+
+// 平台不可用 / 失败时自动退回本地路径（原因如实带回，不假装成功）
+{ "ok": true, "engine": "local", "fellBack": "平台事务失败: ...", "result": [ ... ], "summary": { "total": 12, "failed": 0 } }
+
+// 点名重载（仍走本地路径）
+{ "ok": true, "engine": "local", "result": [ { "pkg": "<plugin-a>", "ok": true, "cleared": 31 } ], "summary": { "total": 1, "failed": 0 } }
 ```
+
+`summary.failed > 0` 就是**真的有包没换成功**——这是「假成功」的拦截点。响应里还带 `restartReason`（平台认为必须重启的原因），有值就说明有些改动不是热重载能覆盖的。
 
 ### 已知行为变化（用它之前要知道）
 
