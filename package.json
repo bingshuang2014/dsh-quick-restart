@@ -1,6 +1,6 @@
 {
   "name": "dsh-quick-restart",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "DeepSeek Harness 插件：标题栏加两个按钮——重载第三方插件（不用重启宿主）、重启 DSH。",
   "keywords": [
@@ -24,7 +24,8 @@
     "README.md",
     "LICENSE",
     "docs",
-    "images"
+    "images",
+    "selftest-query-propagation.mjs"
   ],
   "engines": {
     "node": ">=20"
@@ -94,5 +95,8 @@
     ],
     "knownBehaviorChange": "被重载模块里的 import.meta.url 会带上 ?dshReload=<ts>（击穿引擎级缓存的代价）。fileURLToPath 仍正常、相对依赖不会被复制成两份；但把 import.meta.url 拿去做字符串拼接的插件会看到多出来的 query。",
     "howToVerify": "POST /dsh-quick-restart/reload {\"confirm\":true,\"packages\":[\"<pkg>\"]} 看响应里的 cleared；真正判据是「可观测标记」对照实验：改一处 health 返回值 → 重载 → 字段出现。必须**连续做 3 次**（M1→M2→M3），因为缺陷④ 只在第二次以后暴露。详见 README 的「本地修复」小节。"
+  },
+  "scripts": {
+    "test": "node selftest-query-propagation.mjs"
   }
 }
